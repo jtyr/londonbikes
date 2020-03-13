@@ -1,0 +1,245 @@
+#!/usr/bin/env python
+
+"""
+Usage:
+  londonbikes search <search_string>
+  londonbikes search <latitude> <longitude> <radius_in_metres>
+  londonbikes id <bike_point_id>
+"""
+
+try:
+    from docopt import docopt
+    HAS_DOCOPT = True
+except ImportError:
+    HAS_DOCOPT = False
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
+
+import logging
+import math
+import os
+import sys
+
+
+class TflBikePoint():
+    def __init__(self, log, app_id, app_key):
+        self.log = log
+        self.url = 'https://api.tfl.gov.uk/BikePoint'
+        self.headers = {
+            'app_id': app_id,
+            'app_key': app_key,
+        }
+
+    def _query(self, url):
+        try:
+            response = requests.get(url, headers=self.headers)
+        except Exception as e:
+            self._error("GET error: %s" % str(e))
+
+        # Check if the respons was successful
+        if response.status_code != 200:
+            self.log.error("Unsuccessful query.")
+            sys.exit(1)
+
+        # Return data as JSON
+        return response.json()
+
+    def search(self, query):
+        self.log.debug("Searching for string '%s'" % query)
+
+        return self._query("%s/Search?query=%s" % (self.url, query))
+
+    def all(self):
+        self.log.debug("Getting all BikePoints")
+
+        return self._query(self.url)
+
+    def id_info(self, id):
+        self.log.debug("Getting info for ID '%s'" % id)
+
+        return self._query("%s/%s" % (self.url, id))
+
+
+class LondonBikes():
+    def __init__(self, log, args, api):
+        self.log = log
+        self.args = args
+        self.api = api
+
+    def _to_rad(self, val):
+        # Return rad value
+        return val * math.pi / 180
+
+    def _distance(self, lat1, lon1, lat2, lon2):
+        # Earth radius
+        radius = 6371e3
+
+        # Calculate distance
+        lat1r = self._to_rad(lat1)
+        lon1r = self._to_rad(lon1)
+        lat2r = self._to_rad(lat2)
+        lon2r = self._to_rad(lon2)
+        lat_delta = lat2r - lat1r
+        lon_delta = lon2r - lon1r
+
+        a = (
+            math.sin(lat_delta/2) * math.sin(lat_delta/2) +
+            math.cos(lat1r) * math.cos(lat2r) *
+            math.sin(lon_delta/2) * math.sin(lon_delta/2))
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        d = radius * c
+
+        return d
+
+    def _fnorm(self, val):
+        # Normalize float numbers
+        return str(val).rstrip('0').rstrip('.')
+
+    def format(self, data, padding=2):
+        # Get list of lengths of the longest string in each column
+        col_widths = [
+            max(len(str(col)) + padding for col in row) for row in zip(*data)]
+
+        # Print the individual rows
+        for row in data:
+            print(
+                ''.join(
+                    str(col).ljust(width)
+                    for col, width in zip(row, col_widths)))
+
+    def id_info(self):
+        self.log.debug('ID info...')
+
+        # Check if the input is empty string
+        if len(self.args['<bike_point_id>']) == 0:
+            self.log.error("Please specify a bike point id")
+            sys.exit(12)
+
+        # Query data
+        data = self.api.id_info(self.args['<bike_point_id>'])
+
+        # Extract the number of bikes and empty docks
+        bikes = next(
+            item['value']
+            for item in data['additionalProperties']
+            if item['key'] == 'NbBikes')
+        empty_docks = next(
+            item['value']
+            for item in data['additionalProperties']
+            if item['key'] == 'NbEmptyDocks')
+
+        # Compose the table data
+        table_data = (
+            ('Name', 'Latitude', 'Longitude', 'Num Bikes', 'Empty Docks'),
+            (data['commonName'], data['lat'], data['lon'], bikes, empty_docks),
+        )
+
+        return table_data
+
+    def search(self):
+        if self.args['<search_string>'] is not None:
+            self.log.debug('Search for string...')
+
+            # Check if the input is empty string
+            if len(self.args['<search_string>']) == 0:
+                self.log.error("Please specify a search term")
+                sys.exit(10)
+
+            data = self.api.search(self.args['<search_string>'])
+
+            # Compose the table data
+            table_data = [('Id', 'Name', 'Latitude', 'Longitude')]
+
+            for item in data:
+                table_data += [
+                    (item['id'], item['commonName'], item['lat'], item['lon'])]
+
+            return table_data
+        else:
+            self.log.debug('Search radius...')
+
+            # Query data
+            data = self.api.all()
+
+            # Compose the table data
+            table_header = [('Id', 'Name', 'Latitude,Longitude', 'Distance')]
+            rows_data = []
+
+            for item in data:
+                distance = self._distance(
+                    float(self.args['<latitude>']),
+                    float(self.args['<longitude>']),
+                    item['lat'],
+                    item['lon'])
+
+                if distance <= int(self.args['<radius_in_metres>']):
+                    lat_norm = self._fnorm(item['lat'])
+                    lon_norm = self._fnorm(item['lon'])
+                    rows_data += [(
+                        item['id'],
+                        item['commonName'],
+                        "%s,%s" % (lat_norm, lon_norm),
+                        "%.1f" % distance)]
+
+            # Check if we got some data
+            if len(rows_data) == 0:
+                self.log.error("The search request is invalid")
+                sys.exit(11)
+
+            return table_header + sorted(rows_data, key=lambda x: x[3])
+
+
+def main():
+    # Get logger
+    log = logging.getLogger(__name__)
+
+    # Configure logging
+    level = logging.WARNING
+
+    if os.getenv('LONDONBIKES_DEBUG') in ('1', 'yes', 'YES', 'true', 'TRUE'):
+        level = logging.DEBUG
+
+    logging.basicConfig(format='%(levelname)s: %(message)s', level=level)
+
+    # Check if required modules are loaded
+    if not HAS_DOCOPT:
+        log.error("The docopt Python module is not installed.")
+        sys.exit(1)
+    elif not HAS_REQUESTS:
+        log.error("The requests Python module is not installed.")
+        sys.exit(1)
+
+    # Read command line arguments
+    args = docopt(__doc__, options_first=True)
+
+    # Check the API creds
+    if os.getenv('TFL_APP_ID') is None:
+        log.error("Define TFL_APP_ID env var with your Application ID.")
+        sys.exit(1)
+    elif os.getenv('TFL_APP_KEY') is None:
+        log.error("Define TFL_APP_KEY env var with your Application Key.")
+        sys.exit(1)
+
+    # Instantiate API object
+    bike_point = TflBikePoint(
+        log,
+        os.getenv('TFL_APP_ID'),
+        os.getenv('TFL_APP_KEY'))
+
+    # Instantiate script object
+    ldn_bikes = LondonBikes(log, args, bike_point)
+
+    # Decide what to do
+    if args['id']:
+        ldn_bikes.format(ldn_bikes.id_info())
+    elif args['search']:
+        ldn_bikes.format(ldn_bikes.search())
+
+
+if __name__ == '__main__':
+    main()
